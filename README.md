@@ -1378,3 +1378,27 @@ text
 [VOICE:Ryan] Today we are practicing [ES]hola[ES].
 [VOICE:Serena] That means hello.
 
+There are two different “custom voice” paths in this repo:
+
+1. Built-in CustomVoice model
+This is what you’re using with:
+
+Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice
+It only supports the model’s built-in speakers like Ryan, Aiden, Serena, Vivian, etc. You can switch between those, but you can’t upload a new voice into that model from the UI.
+
+2. Voice clone Base model
+This is the upload-your-own-voice path. You’d run a Base checkpoint instead:
+
+.\.venv\Scripts\qwen-tts-demo.exe Qwen/Qwen3-TTS-12Hz-0.6B-Base --ip 127.0.0.1 --port 8000 --device cuda:0 --dtype float16 --no-flash-attn --concurrency 1 --max-new-tokens 1024
+Then the UI will show:
+
+Reference audio
+Reference transcript
+Use x-vector only
+You upload a short voice sample, ideally 3-10 seconds, and provide the exact transcript of what is said in that audio. Then the generated script uses that cloned voice.
+
+Important limitation with the current UI: the Base voice-clone mode supports one uploaded reference voice at a time. The multi-speaker [Ryan] / [Serena] tagging is for the built-in CustomVoice model. We could extend Base mode later to support multiple uploaded voices, like:
+
+[VOICE:Teacher] ...
+[VOICE:Student] ...
+with a small voice-library panel where you upload one reference clip per named voice.
