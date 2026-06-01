@@ -1359,3 +1359,22 @@ If you find our paper and code useful in your research, please consider giving a
 
 
 <br>
+
+
+.\.venv\Scripts\qwen-tts-demo.exe Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice --ip 127.0.0.1 --port 8000 --device cuda:0 --dtype float16 --no-flash-attn --concurrency 1
+
+
+.\.venv\Scripts\qwen-tts-demo.exe Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --ip 127.0.0.1 --port 8000 --device cuda:0 --dtype float16 --no-flash-attn --concurrency 1 --max-new-tokens 512
+
+[Ryan] Today we are practicing [ES]buenos dias[ES].
+[Serena] Great. [ES]Buenos dias[ES] means good morning.
+[Ryan] Repeat after me: [ES]buenos dias[ES].
+[Serena] Nice work.
+Or more explicit:
+
+text
+
+
+[VOICE:Ryan] Today we are practicing [ES]hola[ES].
+[VOICE:Serena] That means hello.
+

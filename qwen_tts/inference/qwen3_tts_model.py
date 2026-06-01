@@ -796,7 +796,8 @@ class Qwen3TTSModel:
         texts = self._ensure_list(text)
         languages = self._ensure_list(language) if isinstance(language, list) else ([language] * len(texts) if language is not None else ["Auto"] * len(texts))
         speakers = self._ensure_list(speaker)
-        if self.model.tts_model_size in "0b6": # for 0b6 model, instruct is not supported
+        model_size = str(getattr(self.model, "tts_model_size", "")).lower()
+        if "0.6" in model_size or "0b6" in model_size: # for 0.6B model, instruct is not supported
             instruct = None
         instructs = self._ensure_list(instruct) if isinstance(instruct, list) else ([instruct] * len(texts) if instruct is not None else [""] * len(texts))
 

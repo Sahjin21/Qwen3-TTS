@@ -65,7 +65,7 @@ _TAG_LANGUAGE_ALIASES = {
     "CN": "Chinese",
     "CHINESE": "Chinese",
 }
-_TAG_RE = re.compile(r"\[(/?)([A-Za-z]{2,12})\]")
+_TAG_RE = re.compile(r"\[(/?)([^\[\]]{1,64})\]")
 
 
 def _title_case_display(s: str) -> str:
@@ -223,7 +223,14 @@ def _clean_text_chunk(text: str) -> str:
     return re.sub(r"\s+", " ", text or "").strip()
 
 
-def _append_segment(segments: List[Dict[str, str]], language: str, text: str) -> None:
+def _normalize_tag_name(tag: str) -> str:
+    tag = (tag or "").strip()
+    if ":" in tag:
+        _, tag = tag.split(":", 1)
+    return tag.strip()
+
+
+def _append_segment(segments: List[Dict[str, str]], language: str, speaker: str, text: str) -> None:
     text = _clean_text_chunk(text)
     if not text:
         return
@@ -236,10 +243,10 @@ def _append_segment(segments: List[Dict[str, str]], language: str, text: str) ->
         text = leading_punctuation.group(2).strip()
         if not text:
             return
-    if segments and segments[-1]["language"] == language:
+    if segments and segments[-1]["language"] == language and segments[-1].get("speaker") == speaker:
         segments[-1]["text"] = f"{segments[-1]['text']} {text}".strip()
     else:
-        segments.append({"language": language, "text": text})
+        segments.append({"language": language, "speaker": speaker, "text": text})
 
 
 def _split_long_text(text: str, max_chars: int) -> List[str]:
@@ -284,16 +291,28 @@ def _split_long_text(text: str, max_chars: int) -> List[str]:
     return chunks
 
 
-def _parse_tagged_script(script: str, base_language: str, max_chars: int) -> List[Dict[str, str]]:
+def _parse_tagged_script(
+    script: str,
+    base_language: str,
+    max_chars: int,
+    base_speaker: str = "",
+    speaker_lookup: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, str]]:
     base_language = base_language or "English"
     current_language = base_language
+    base_speaker = base_speaker or ""
+    current_speaker = base_speaker
+    speaker_lookup = speaker_lookup or {}
     segments: List[Dict[str, str]] = []
     pos = 0
 
     for match in _TAG_RE.finditer(script or ""):
-        _append_segment(segments, current_language, script[pos:match.start()])
+        _append_segment(segments, current_language, current_speaker, script[pos:match.start()])
         is_closing, raw_tag = match.groups()
-        tagged_language = _TAG_LANGUAGE_ALIASES.get(raw_tag.upper())
+        tag_name = _normalize_tag_name(raw_tag)
+        tag_key = re.sub(r"[\s_-]+", "", tag_name).lower()
+        tagged_language = _TAG_LANGUAGE_ALIASES.get(tag_name.upper())
+        tagged_speaker = speaker_lookup.get(tag_key)
         if tagged_language:
             if is_closing:
                 current_language = base_language
@@ -301,14 +320,21 @@ def _parse_tagged_script(script: str, base_language: str, max_chars: int) -> Lis
                 current_language = base_language
             else:
                 current_language = tagged_language
+        elif tagged_speaker:
+            if is_closing:
+                current_speaker = base_speaker
+            else:
+                current_speaker = tagged_speaker
+        elif is_closing and tag_name.lower() in ("voice", "speaker"):
+            current_speaker = base_speaker
         pos = match.end()
 
-    _append_segment(segments, current_language, (script or "")[pos:])
+    _append_segment(segments, current_language, current_speaker, (script or "")[pos:])
 
     split_segments: List[Dict[str, str]] = []
     for seg in segments:
         for chunk in _split_long_text(seg["text"], max_chars):
-            split_segments.append({"language": seg["language"], "text": chunk})
+            split_segments.append({"language": seg["language"], "speaker": seg.get("speaker", ""), "text": chunk})
     return split_segments
 
 
@@ -320,7 +346,8 @@ def _preview_segments(segments: List[Dict[str, str]], limit: int = 100) -> str:
         text = seg["text"]
         if len(text) > 180:
             text = text[:177].rstrip() + "..."
-        lines.append(f"{i:02d}. [{seg['language']}] {text}")
+        speaker = seg.get("speaker") or "Default"
+        lines.append(f"{i:02d}. [{speaker}] [{seg['language']}] {text}")
     if len(segments) > limit:
         lines.append(f"... {len(segments) - limit} more segment(s)")
     return "\n".join(lines)
@@ -374,15 +401,30 @@ def _concat_wavs(wavs: List[np.ndarray], sr: int, silence_ms: int) -> np.ndarray
     return np.clip(np.concatenate(pieces), -1.0, 1.0).astype(np.float32)
 
 
-def _write_temp_wav(wav: np.ndarray, sr: int) -> str:
-    fd, out_path = tempfile.mkstemp(prefix="qwen_tts_script_", suffix=".wav")
+def _write_temp_audio(wav: np.ndarray, sr: int, output_format: str) -> Tuple[str, str]:
+    requested = (output_format or "MP3").strip().upper()
+    fmt = "MP3" if requested == "MP3" else "WAV"
+    suffix = ".mp3" if fmt == "MP3" else ".wav"
+    fd, out_path = tempfile.mkstemp(prefix="qwen_tts_script_", suffix=suffix)
     os.close(fd)
-    sf.write(out_path, wav, sr)
-    return out_path
+    try:
+        if fmt == "MP3":
+            sf.write(out_path, wav, sr, format="MP3")
+        else:
+            sf.write(out_path, wav, sr, format="WAV")
+        return out_path, fmt
+    except Exception:
+        if fmt == "WAV":
+            raise
+        fallback = out_path[:-4] + ".wav"
+        sf.write(fallback, wav, sr, format="WAV")
+        return fallback, "WAV"
 
 
 def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]) -> gr.Blocks:
     model_kind = _detect_model_kind(tts)
+    model_size = str(getattr(tts.model, "tts_model_size", "")).lower()
+    custom_voice_supports_instruction = not ("0.6" in model_size or "0b6" in model_size)
 
     supported_langs_raw = None
     if callable(getattr(tts.model, "get_supported_languages", None)):
@@ -396,6 +438,11 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
     spk_choices_disp, spk_map = _build_choices_and_map([x for x in (supported_spks_raw or [])])
     lang_lookup = {str(v).lower(): v for v in (supported_langs_raw or [])}
     lang_lookup.update({str(k).lower(): v for k, v in lang_map.items()})
+    speaker_lookup: Dict[str, str] = {}
+    for display, raw in spk_map.items():
+        for value in (display, raw, str(raw).replace("_", " ")):
+            key = re.sub(r"[\s_-]+", "", str(value)).lower()
+            speaker_lookup[key] = raw
 
     def resolve_language(name: str) -> str:
         if not name:
@@ -432,8 +479,8 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                 script_in = gr.Textbox(
                     label="Script",
                     lines=16,
-                    value="Today we are practicing [ES]buenos dias[ES]. It means good morning. Repeat after me: [ES]buenos dias[ES].",
-                    placeholder="Paste a script here. Use [ES]hola[ES], [DE]guten Morgen[DE], [FR]bonjour[FR], etc.",
+                    value="[Ryan] Today we are practicing [ES]buenos dias[ES].\n[Serena] Great. [ES]Buenos dias[ES] means good morning.",
+                    placeholder="Paste a script here. Use [Ryan] or [VOICE:Serena] for speakers, and [ES]hola[ES], [DE]guten Morgen[DE], etc. for language spans.",
                 )
                 script_file = gr.File(label="Optional .txt script upload", file_types=[".txt"])
                 with gr.Row():
@@ -445,6 +492,12 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     )
                     max_chars_in = gr.Number(label="Max characters per segment", value=650, precision=0)
                     silence_in = gr.Number(label="Pause between segments (ms)", value=180, precision=0)
+                    output_format_in = gr.Dropdown(
+                        label="Download format",
+                        choices=["MP3", "WAV"],
+                        value="MP3",
+                        interactive=True,
+                    )
                 with gr.Row():
                     preview_btn = gr.Button("Preview Segments")
                     generate_btn = gr.Button("Generate Script Audio", variant="primary")
@@ -457,11 +510,14 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                         value=default_speaker,
                         interactive=True,
                     )
-                    instruct_in = gr.Textbox(
-                        label="Optional style instruction",
-                        lines=3,
-                        placeholder="Example: friendly teacher voice, clear pronunciation, natural pace.",
-                    )
+                    if custom_voice_supports_instruction:
+                        instruct_in = gr.Textbox(
+                            label="Optional style instruction",
+                            lines=3,
+                            placeholder="Example: friendly teacher voice, clear pronunciation, natural pace.",
+                        )
+                    else:
+                        instruct_in = gr.State("")
                     design_in = gr.State("")
                     ref_audio = gr.State(None)
                     ref_text = gr.State("")
@@ -492,14 +548,15 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                 preview_out = gr.Textbox(label="Segment preview", lines=12)
                 status_out = gr.Textbox(label="Status", lines=4)
                 audio_out = gr.Audio(label="Generated audio", type="numpy")
-                file_out = gr.File(label="Download WAV")
+                file_out = gr.File(label="Download audio")
 
-        def preview_script(script_text: str, file_obj, base_lang_disp: str, max_chars):
+        def preview_script(script_text: str, file_obj, base_lang_disp: str, max_chars, speaker_disp: str):
             script = _script_from_inputs(script_text, file_obj)
             if not script.strip():
                 return "No script text found."
             base_language = resolve_language(lang_map.get(base_lang_disp, base_lang_disp))
-            segments = _parse_tagged_script(script, base_language, int(max_chars or 650))
+            base_speaker = spk_map.get(speaker_disp, speaker_disp) if model_kind == "custom_voice" else ""
+            segments = _parse_tagged_script(script, base_language, int(max_chars or 650), base_speaker, speaker_lookup)
             return _preview_segments(segments)
 
         def generate_script(
@@ -508,6 +565,7 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             base_lang_disp: str,
             max_chars,
             silence_ms,
+            output_format: str,
             speaker_disp: str,
             instruct: str,
             design: str,
@@ -521,7 +579,8 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     return None, None, "No script segments found.", "Paste a script or upload a .txt file."
 
                 base_language = resolve_language(lang_map.get(base_lang_disp, base_lang_disp))
-                segments = _parse_tagged_script(script, base_language, int(max_chars or 650))
+                base_speaker = spk_map.get(speaker_disp, speaker_disp) if model_kind == "custom_voice" else ""
+                segments = _parse_tagged_script(script, base_language, int(max_chars or 650), base_speaker, speaker_lookup)
                 if not segments:
                     return None, None, "No script segments found.", "No script segments found."
 
@@ -533,7 +592,6 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                 if model_kind == "custom_voice":
                     if not speaker_disp:
                         return None, None, _preview_segments(segments), "Choose a speaker."
-                    speaker = spk_map.get(speaker_disp, speaker_disp)
                 elif model_kind == "voice_design":
                     if not design or not design.strip():
                         return None, None, _preview_segments(segments), "Voice design instruction is required."
@@ -553,11 +611,15 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
                     language = resolve_language(seg["language"])
                     text = seg["text"]
                     if model_kind == "custom_voice":
+                        speaker = seg.get("speaker") or spk_map.get(speaker_disp, speaker_disp)
+                        effective_instruct = (instruct or "").strip() or None
+                        if not custom_voice_supports_instruction:
+                            effective_instruct = None
                         wavs, sr = tts.generate_custom_voice(
                             text=text,
                             language=language,
                             speaker=speaker,
-                            instruct=(instruct or "").strip() or None,
+                            instruct=effective_instruct,
                             **kwargs,
                         )
                     elif model_kind == "voice_design":
@@ -579,9 +641,11 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
 
                 assert sr_out is not None
                 final_wav = _concat_wavs(wavs_out, sr_out, int(silence_ms or 0))
-                wav_path = _write_temp_wav(final_wav, sr_out)
-                status = f"Finished. Generated {len(segments)} segment(s) into one WAV."
-                return _wav_to_gradio_audio(final_wav, sr_out), wav_path, _preview_segments(segments), status
+                audio_path, actual_format = _write_temp_audio(final_wav, sr_out, output_format)
+                status = f"Finished. Generated {len(segments)} segment(s) into one {actual_format} file."
+                if actual_format != (output_format or "MP3").upper():
+                    status += " MP3 encoding was unavailable, so WAV was used."
+                return _wav_to_gradio_audio(final_wav, sr_out), audio_path, _preview_segments(segments), status
             except Exception as e:
                 return None, None, "", f"{type(e).__name__}: {e}"
 
@@ -591,6 +655,7 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             base_lang_in,
             max_chars_in,
             silence_in,
+            output_format_in,
             speaker_in,
             instruct_in,
             design_in,
@@ -598,13 +663,13 @@ def build_demo(tts: Qwen3TTSModel, ckpt: str, gen_kwargs_default: Dict[str, Any]
             ref_text,
             xvec_only,
         ]
-        preview_btn.click(preview_script, inputs=[script_in, script_file, base_lang_in, max_chars_in], outputs=[preview_out])
+        preview_btn.click(preview_script, inputs=[script_in, script_file, base_lang_in, max_chars_in, speaker_in], outputs=[preview_out])
         generate_btn.click(generate_script, inputs=common_inputs, outputs=[audio_out, file_out, preview_out, status_out])
 
         gr.Markdown(
             """
 **Use note**  
-Tagged spans are generated as separate segments and stitched into one WAV. Use consent-based reference audio for cloning, and review pronunciation before publishing language-learning material.
+Tagged spans are generated as separate segments and stitched into one audio file. Use speaker tags like [Ryan] or [VOICE:Serena], language tags like [ES]hola[ES], and consent-based reference audio for cloning.
 """
         )
 
